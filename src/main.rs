@@ -103,7 +103,8 @@ impl Node {
         let file_name = format!("{}.m4a", self.name);
         let (_, path) = self.previewUrl.rsplit_once("previews/").unwrap();
         let song_uuid = path.replace(".mp3", ".m4a");
-        let mp3_url = format!("https://stream1.mixcloud.com/secure/c/m4a/64/{}?sig=aktXwbujA7gIzbLBIYTlYQ", song_uuid);
+        // TODO: need to generate proper sig
+        let mp3_url = format!("https://stream1.mixcloud.com/secure/c/m4a/64/{}?sig=uzuqZfZ0Mzaei_moO_1kgA", song_uuid);
         let mut response = reqwest::get(&mp3_url).await.unwrap();
         match response.status() {
             reqwest::StatusCode::OK => {
