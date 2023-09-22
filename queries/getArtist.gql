@@ -354,7 +354,7 @@ fragment UserUploadsPage_user_7FfCv on User {
     username
     isViewer
     ...ShareAudioCardList_user
-    uploads(first: 10, isPublic: true, orderBy: $orderBy, audioTypes: [SHOW]) {
+    uploads(first: 50, isPublic: true, orderBy: $orderBy, audioTypes: [SHOW]) {
         edges {
             node {
                 ...AudioCard_cloudcast

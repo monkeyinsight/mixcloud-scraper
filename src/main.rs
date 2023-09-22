@@ -1,15 +1,12 @@
 use reqwest::Client;
 use async_recursion::async_recursion;
-use reqwest::ClientBuilder;
-use std::future::Future;
-use std::pin::Pin;
 use reqwest::Error;
-use regex::Regex;
 use rust_embed::RustEmbed;
-use std::collections::HashMap;
-use std::io::{copy,Cursor};
+use std::{io::Write, collections::HashMap};
 use clap::Parser;
 use serde::{Deserialize,Serialize};
+use indicatif::ProgressBar;
+use std::fs;
 
 #[derive(RustEmbed)]
 #[folder = "queries"]
@@ -72,10 +69,59 @@ struct Edge {
 #[derive(Deserialize, Debug)]
 struct Node {
     id: String,
-    slug: String,
     name: String,
-    audioType: String,
     previewUrl: String
+}
+
+/*struct Cache {*/
+    /*file: String*/
+/*}*/
+
+/*impl Cache {*/
+    /*fn read(self) -> Result<HashMap<String, Vec<&'static str>>, Box<dyn std::error::Error>> {*/
+        /*let file_contents = fs::read_to_string("address.txt")?;*/
+        /*let cache: HashMap<String, Vec<&str>> = HashMap::new();*/
+        /*let artists: Vec<&str> = file_contents.split("\n").collect();*/
+        /*artists.into_iter().for_each(|artist| {*/
+            /*let (a, tracks_str) = artist.rsplit_once(":").unwrap();*/
+            /*let tracks: Vec<&str> = tracks_str.split(";").collect();*/
+            /*cache.insert(a.to_string(), tracks);*/
+        /*});*/
+        /*Ok(cache)*/
+    /*}*/
+
+    /*fn save(self, content: String) -> Result<(), &'static str> {*/
+        /*match fs::write(self.file, content) {*/
+            /*Ok(_) => Ok(()),*/
+            /*Err(_) => Err("Error writting in file")*/
+        /*}*/
+    /*}*/
+/*}*/
+
+impl Node {
+    async fn download(self) -> Result<(), Error> {
+        let file_name = format!("{}.m4a", self.name);
+        let (_, path) = self.previewUrl.rsplit_once("previews/").unwrap();
+        let song_uuid = path.replace(".mp3", ".m4a");
+        let mp3_url = format!("https://stream1.mixcloud.com/secure/c/m4a/64/{}?sig=aktXwbujA7gIzbLBIYTlYQ", song_uuid);
+        let mut response = reqwest::get(&mp3_url).await.unwrap();
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                println!("Downloading {} from {}", self.name, mp3_url);
+                let size = response.content_length().unwrap();
+                let progress = ProgressBar::new(size);
+                let mut file = fs::File::create(&file_name).unwrap();
+                while let Some(chunk) = response.chunk().await? {
+                    progress.inc(chunk.len() as u64);
+                    let _ = file.write_all(&chunk);
+                }
+            }
+            _other => {
+                println!("url {} failed", &mp3_url);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -88,7 +134,7 @@ struct Payload<'a> {
 struct Variables<'a> {
     lookup: Option<Lookup<'a>>,
     orderBy: String,
-    count: u8,
+    count: u32,
     cursor: Option<String>,
     id: Option<String>
 }
@@ -101,8 +147,11 @@ struct Lookup<'a> {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let data = get_data("otographic".to_string()/* args.artist.unwrap() */).await;
-    println!("{:?}", data.unwrap());
+    let data = get_data(args.artist.unwrap()).await.unwrap();
+    println!("Found {} tracks.", data.len());
+    for node in data {
+        let _ = node.download().await;
+    }
     Ok(())
 }
 
@@ -111,12 +160,13 @@ async fn recursive_pages(
     get_songs: String,
     client: Client,
     id: String,
-    cursor: Option<String>
+    cursor: Option<String>,
+    page: u8
 ) -> Result<Vec<Node>, String> {
     let variables = Variables {
         lookup: None,
         orderBy: "LATEST".to_string(),
-        count: 20,
+        count: 50,
         cursor,
         id: Some(id.to_string())
     };
@@ -124,24 +174,42 @@ async fn recursive_pages(
         query: &get_songs,
         variables
     };
-    println!("{:?}", serde_json::json!(&payload).to_string());
     let response = client.post("https://app.mixcloud.com/graphql")
         .header("Host", "app.mixcloud.com")
         .json(&payload)
         .send()
         .await
         .unwrap();
-
+    println!("Getting page {}: {}\n{}", page, response.status(), serde_json::json!(&payload).to_string());
     match response.status() {
         reqwest::StatusCode::OK => {
-            let res = response.json::<SongsResponse>().await.unwrap();
-            println!("{:?}", res);
-            let mut uploads: Vec<Node> = res.data.node.uploads.edges.into_iter().map(|x| x.node).collect();
-            if res.data.node.uploads.pageInfo.hasNextPage {
-                let mut results = recursive_pages(get_songs, client, id.to_owned(), Some(res.data.node.uploads.pageInfo.endCursor)).await.unwrap();
-                uploads.append(&mut results);
+            let text = response.text().await.unwrap();
+            println!("{}", text); 
+            let res = serde_json::from_str::<SongsResponse>(&text);
+            match res {
+                Ok(res) => {
+                    println!("Response\n{:?}", &res.data);
+                    let mut uploads: Vec<Node> = res.data.node.uploads.edges.into_iter().map(|x| x.node).collect();
+                    println!("Found {} results.", uploads.len());
+                    if res.data.node.uploads.pageInfo.hasNextPage {
+                        match recursive_pages(
+                            get_songs,
+                            client,
+                            id.to_owned(),
+                            Some(res.data.node.uploads.pageInfo.endCursor),
+                            page+1
+                        ).await {
+                            Ok(mut results) => uploads.append(&mut results),
+                            Err(_) => {}
+                        };
+                    }
+                    Ok(uploads)
+                },
+                Err(error) => {
+                    Err(format!("{}", error))
+                }
             }
-            Ok(uploads)
+            
         },
         status => Err(format!("Error fetching request\n{}", status))
     }
@@ -160,7 +228,7 @@ async fn get_data(artist: String) -> Result<Vec<Node>, &'static str> {
     let variables = Variables {
         lookup: Some(lookup),
         orderBy: "LATEST".to_string(),
-        count: 20,
+        count: 1000,
         cursor: None,
         id: None
     };
@@ -180,56 +248,19 @@ async fn get_data(artist: String) -> Result<Vec<Node>, &'static str> {
             let get_songs = Asset::get("queries/getSongs.gql").unwrap();
             let res = response.json::<ArtistResponse>().await.unwrap();
             let mut uploads: Vec<Node> = res.data.user.uploads.edges.into_iter().map(|x| x.node).collect();
+            println!("{}", uploads.len());
             if res.data.user.uploads.pageInfo.hasNextPage {
-                let mut results = recursive_pages(std::str::from_utf8(&get_songs.data.as_ref()).unwrap().to_string(), client, res.data.user.id, Some(res.data.user.uploads.pageInfo.endCursor)).await.unwrap();
+                let mut results = recursive_pages(
+                    std::str::from_utf8(&get_songs.data.as_ref()).unwrap().to_string().replace("\\n", ""),
+                    client,
+                    res.data.user.id,
+                    Some(res.data.user.uploads.pageInfo.endCursor),
+                    0
+                ).await.unwrap();
                 uploads.append(&mut results);
             }
             Ok(uploads)
         },
         _other => Err("test")
     }
-    
-    // let response = client.get(format!("https://www.mixcloud.com/{}/", &artist)).send().await.unwrap();
-    // match response.status() {
-    //     reqwest::StatusCode::OK => {
-    //         let body = response.text().await?;
-    //         let re = Regex::new(r#"\"name\":\"([^"]+?)\",\"audi.+?\"previewUrl\":\"(.+?)\""#).unwrap();
-    //         let mut results: Vec<Track> = vec![];
-
-    //         for (_, [name, url]) in re.captures_iter(&body).map(|c| c.extract()) {
-    //             results.push(Track { name: name.to_owned(), url: url.to_owned() });
-    //         }
-    //         println!("{:?}", results);
-    //         for track in results {
-    //             let _ = fetch_mixcloud(track).await;
-    //         }
-    //     }
-    //     _other => println!("Unexpected status code: {}", response.status())
-    // }
 }
-
-// async fn fetch_mixcloud(track: Track) -> Result<(), Error> {
-//     let file_name = format!("{}.m4a", track.name);
-//     let (_, path) = track.url.rsplit_once("previews/").unwrap();
-//     let song_uuid = path.replace(".mp3", ".m4a");
-//     for server in 1..23 {
-//         let mp3_url = format!("https://stream{}.mixcloud.com/secure/c/m4a/64/{}?sig=aktXwbujA7gIzbLBIYTlYQ", server.to_string(), song_uuid);
-//         let response = reqwest::get(&mp3_url).await;
-//         match response {
-//             Ok(response) => {
-//                 match response.status() {
-//                     reqwest::StatusCode::OK => {
-//                         let mut file = std::fs::File::create(&file_name).unwrap();
-//                         let mut content = Cursor::new(response.bytes().await.unwrap());
-//                         copy(&mut content, &mut file).unwrap();
-//                     }
-//                     _other => {
-//                         println!("url {} failed", &mp3_url);
-//                     }
-//                 }
-//             }
-//             Error => {}
-//         }
-//     }
-//     Ok(())
-// }
